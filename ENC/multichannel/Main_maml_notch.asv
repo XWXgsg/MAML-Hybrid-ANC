@@ -1,0 +1,284 @@
+%% MAML-Notch: Multi-channel training  (Phi [M x L] per frequency)
+%
+%  Trains MAML initialisation weights Phi_sin [M x L] / Phi_cos [M x L]
+%  for the multi-channel NotchController (K=1 tone per task).
+%
+%  Each (m, l) pair is trained independently inside MAML_notch.MAML_initial:
+%    e(l) = Di(l) + sum_m[Phi_sin(m,l)*Fx_sin(m,l) + Phi_cos(m,l)*Fx_cos(m,l)]
+%    grad_sin(m,l) = -epslon*(mu/Li) * e(l) * Fx_sin(m,l) * lamda^(jj-1)
+%
+%  Initialising NotchController.w after training:
+%    w(1, k, m) = sum_l Phi_sin(m, l)    <- sum over mics, speaker m
+%    w(2, k, m) = sum_l Phi_cos(m, l)
+%  This is consistent with the controller gradient: sum_l [ r(m,l,k)*e(l) ]
+%
+%  weight_table layout [N_freq x (1 + 2*M*L)]:
+%    col 1       : frequency
+%    remaining   : [sin(m=1,l=1), cos(m=1,l=1),
+%                   sin(m=2,l=1), cos(m=2,l=1), ...   <- l=1, m inner
+%                   sin(m=1,l=2), cos(m=1,l=2), ...]  <- l=2, m inner
+%    i.e. l outer, m inner (row-major over Phi_sin [M x L])
+%
+%  No primary path. K=1 (single tone per training task).
+%  Files needed: MAML_notch.m, s.mat
+%--------------------------------------------------------------------------
+close all; clear; clc;
+addpath("class\");
+addpath("data\");
+
+%% ========================================================================
+%  USER CONFIG
+%% ========================================================================
+step_size_table = [
+%   freq      mu       alpha
+    10,     1.0,     0.1;
+    30,     0.8,     0.1;
+    50,     1.0,     0.05;
+    80,     1.0,     0.05;
+    100,    1.0,     0.05;
+    130,    1.0,     0.05;
+    160,    0.5,     0.05;
+    200,    0.5,     0.05;
+    250,    0.2,     0.05;
+    300,    0.2,     0.05;
+];
+
+%% =====================  System parameters  ==============================
+fs = 16000;
+J  = 128;
+M  = 2;    % loudspeakers  ← set to your system
+L  = 2;    % error mics    ← set to your system
+
+f_lo   = 50;
+f_hi   = 200;
+f_step = 1;
+freq_list = (f_lo : f_step : f_hi)';
+N_freq    = length(freq_list);
+
+%% =====================  Interpolate step sizes  =========================
+mu_table    = interp1(step_size_table(:,1), step_size_table(:,2), ...
+                      freq_list, 'linear', 'extrap');
+alpha_table = interp1(step_size_table(:,1), step_size_table(:,3), ...
+                      freq_list, 'linear', 'extrap');
+mu_table    = 5*max(mu_table,    1e-6);
+alpha_table = max(alpha_table, 1e-6);
+
+fprintf('Frequency band : %d - %d Hz,  %d points\n', f_lo, f_hi, N_freq);
+fprintf('System         : M=%d loudspeakers,  L=%d mics\n', M, L);
+fprintf('Phi shape      : [%d x %d] = %d weights per frequency\n', M, L, 2*M*L);
+
+%% =====================  Secondary path  =================================
+load("s.mat");   % loads 's' [J, M, L]
+if ~isequal(size(s), [J, M, L])
+    error('s must be [%d, %d, %d], got [%s]', J, M, L, num2str(size(s)));
+end
+
+%% =====================  MAML parameters  ================================
+T_train = 2;
+N_train = round(T_train * fs);
+Len_ep  = 512;
+N_epoch = 20000;
+lamda_m = 0.99;
+eps_m   = 0.5;
+
+%% =====================  Storage  ========================================
+% weight_table: [N_freq x (1 + 2*M*L)]
+% col 1 = freq; then pairs (sin, cos) for each (m, l): l outer, m inner
+weight_table = zeros(N_freq, 1 + 2*M*L);
+weight_table(:, 1) = freq_list;
+
+sinBuf_table = zeros(N_freq, J);   % steady-state sin FIFO
+cosBuf_table = zeros(N_freq, J);   % steady-state cos FIFO
+theta_table  = zeros(N_freq, 1);   % steady-state phase
+final_Er     = zeros(N_freq, 1);   % residual training error
+
+% Single MAML object with Phi [M x L], reused via reset()
+maml_obj = MAML_notch(M, L);
+
+%% =====================  Training loop  ==================================
+fprintf('\n========== MAML Training ==========\n');
+tic;
+
+for fi = 1:N_freq
+    f0   = freq_list(fi);
+    mu_f = mu_table(fi);
+
+    maml_obj.reset();
+
+    % ── Generate training signals ─────────────────────────────────────────
+    % Disturbance: d(l) = sin(theta) on every mic (no primary path).
+    % If mics receive spatially different disturbances, replace d_tr below.
+
+    theta_acc = 0;
+    sinBuf    = zeros(1, J);
+    cosBuf    = zeros(1, J);
+
+    d_tr     = zeros(N_train, L);        % [N_train x L]
+    r_sin_tr = zeros(N_train, M, L);     % filtered-x sin [N_train x M x L]
+    r_cos_tr = zeros(N_train, M, L);     % filtered-x cos [N_train x M x L]
+    theta_all = zeros(N_train, 1);
+
+    for n = 1:N_train
+        theta_acc  = mod(theta_acc + 2*pi*f0/fs, 2*pi);
+        xs = sin(theta_acc);
+        xc = cos(theta_acc);
+
+        d_tr(n, :) = xs;   % same tone on all mics
+
+        sinBuf = [xs, sinBuf(1:end-1)];
+        cosBuf = [xc, cosBuf(1:end-1)];
+
+        for m = 1:M
+            for l = 1:L
+                r_sin_tr(n, m, l) = s(:, m, l)' * sinBuf';
+                r_cos_tr(n, m, l) = s(:, m, l)' * cosBuf';
+            end
+        end
+        theta_all(n) = theta_acc;
+    end
+
+    % Record steady-state buffers and phase
+    theta_table(fi)    = theta_all(end);
+    sinBuf_table(fi,:) = sinBuf;
+    cosBuf_table(fi,:) = cosBuf;
+
+    % ── Random episode sampling ───────────────────────────────────────────
+    Fx_sin_ep = zeros(Len_ep, N_epoch, M, L);
+    Fx_cos_ep = zeros(Len_ep, N_epoch, M, L);
+    Di_ep     = zeros(Len_ep, N_epoch, L);
+
+    for jj = 1:N_epoch
+        idx_end = randi([Len_ep + J, N_train]);
+        idx     = (idx_end - Len_ep + 1) : idx_end;
+        Di_ep(:, jj, :) = d_tr(idx, :);
+        for m = 1:M
+            for l = 1:L
+                Fx_sin_ep(:, jj, m, l) = r_sin_tr(idx, m, l);
+                Fx_cos_ep(:, jj, m, l) = r_cos_tr(idx, m, l);
+            end
+        end
+    end
+
+    % ── MAML epochs ───────────────────────────────────────────────────────
+    Er_last = 0;
+    for jj = 1:N_epoch
+        % MAML_initial receives [Len_ep x M x L] and [Len_ep x L]
+        Er_last = maml_obj.MAML_initial( ...
+            squeeze(Fx_sin_ep(:, jj, :, :)), ...   % [Len_ep x M x L]
+            squeeze(Fx_cos_ep(:, jj, :, :)), ...   % [Len_ep x M x L]
+            squeeze(Di_ep(:, jj, :)),          ...  % [Len_ep x L]
+            mu_f, lamda_m, eps_m);
+    end
+    final_Er(fi) = Er_last;
+
+    % ── Store weights — layout: l outer, m inner ──────────────────────────
+    % col index for (m, l): 2 + (l-1)*2*M + (m-1)*2
+    for l = 1:L
+        for m = 1:M
+            col = 2 + (l-1)*2*M + (m-1)*2;
+            weight_table(fi, col)   = maml_obj.Phi_sin(m, l);
+            weight_table(fi, col+1) = maml_obj.Phi_cos(m, l);
+        end
+    end
+
+    % ── Progress print ────────────────────────────────────────────────────
+    if mod(fi, 50) == 0 || fi == 1 || fi == N_freq
+        fprintf('  [%3d/%3d] %4dHz  mu=%.4f', fi, N_freq, f0, mu_f);
+        for l = 1:L
+            for m = 1:M
+                fprintf('  (m%d,l%d):[%+.3f,%+.3f]', m, l, ...
+                    maml_obj.Phi_sin(m,l), maml_obj.Phi_cos(m,l));
+            end
+        end
+        fprintf('  Er=%.3e\n', Er_last);
+    end
+end
+
+train_time = toc;
+fprintf('Training complete. %.1f s\n', train_time);
+
+%% =====================  Save  ===========================================
+save('MAML_weight_table_manual.mat', ...
+    'weight_table', 'freq_list', 'fs', 'J', 's', ...
+    'mu_table', 'alpha_table', 'step_size_table', ...
+    'theta_table', 'sinBuf_table', 'cosBuf_table', ...
+    'lamda_m', 'eps_m', 'N_epoch', 'M', 'L');
+fprintf('Saved: MAML_weight_table_manual.mat\n');
+fprintf('  weight_table  : [%d x %d]  (freq + 2*M*L = %d weights)\n', ...
+        N_freq, 1+2*M*L, 2*M*L);
+fprintf('\n');
+fprintf('  To initialise NotchController.w from Phi:\n');
+fprintf('    w(1,k,m) = sum_l Phi_sin(m,l)   [sum over mics]\n');
+fprintf('    w(2,k,m) = sum_l Phi_cos(m,l)\n');
+
+%% =====================  Print sample  ===================================
+fprintf('\n===== Weight Table Sample =====\n');
+hdr = sprintf('%5s  %6s', 'Freq', 'alpha');
+for l = 1:L
+    for m = 1:M
+        hdr = [hdr, sprintf('  sin(m%d,l%d)  cos(m%d,l%d)', m,l,m,l)]; %#ok
+    end
+end
+fprintf('%s\n%s\n', hdr, repmat('-', 1, length(hdr)));
+for si = round(linspace(1, N_freq, min(20, N_freq)))
+    fprintf('%5.0f  %6.4f', freq_list(si), alpha_table(si));
+    for l = 1:L
+        for m = 1:M
+            col = 2 + (l-1)*2*M + (m-1)*2;
+            fprintf('  %+10.6f  %+10.6f', weight_table(si,col), weight_table(si,col+1));
+        end
+    end
+    fprintf('\n');
+end
+
+%% =====================  Plots  ==========================================
+figure('Name','Phi vs Freq — all (m,l) pairs');
+n_panels = M * L;
+panel = 0;
+for l = 1:L
+    for m = 1:M
+        panel = panel + 1;
+        col   = 2 + (l-1)*2*M + (m-1)*2;
+        subplot(n_panels, 2, 2*panel-1);
+        plot(freq_list, weight_table(:, col),   'b.-', 'MarkerSize', 3);
+        ylabel('\Phi_{sin}');
+        title(sprintf('m=%d, l=%d — \\Phi_{sin}', m, l)); grid on;
+        subplot(n_panels, 2, 2*panel);
+        plot(freq_list, weight_table(:, col+1), 'r.-', 'MarkerSize', 3);
+        ylabel('\Phi_{cos}');
+        title(sprintf('m=%d, l=%d — \\Phi_{cos}', m, l)); grid on;
+    end
+end
+xlabel('Frequency (Hz)');
+
+figure('Name','w_sin / w_cos after summing over L');
+for m = 1:M
+    w_sin_sum = zeros(N_freq, 1);
+    w_cos_sum = zeros(N_freq, 1);
+    for l = 1:L
+        col = 2 + (l-1)*2*M + (m-1)*2;
+        w_sin_sum = w_sin_sum + weight_table(:, col);
+        w_cos_sum = w_cos_sum + weight_table(:, col+1);
+    end
+    subplot(M, 2, 2*m-1);
+    plot(freq_list, w_sin_sum, 'b.-', 'MarkerSize', 3);
+    ylabel('w_{sin}');
+    title(sprintf('m=%d — sum_l \\Phi_{sin}  (init w)', m)); grid on;
+    subplot(M, 2, 2*m);
+    plot(freq_list, w_cos_sum, 'r.-', 'MarkerSize', 3);
+    ylabel('w_{cos}');
+    title(sprintf('m=%d — sum_l \\Phi_{cos}  (init w)', m)); grid on;
+end
+xlabel('Frequency (Hz)');
+
+figure('Name','Steady-state phase');
+plot(freq_list, theta_table, 'k.-', 'MarkerSize', 3);
+xlabel('Freq (Hz)'); ylabel('\theta (rad)');
+title('Steady-state phase per frequency'); grid on;
+
+figure('Name','Training residual error');
+plot(freq_list, abs(final_Er), 'k.-', 'MarkerSize', 3);
+xlabel('Freq (Hz)'); ylabel('|Er|');
+title('Final training error (mean over L mics)'); grid on;
+
+fprintf('\n=== Training Done ===\n');

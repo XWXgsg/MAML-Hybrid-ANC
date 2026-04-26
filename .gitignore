@@ -1,0 +1,17 @@
+# MATLAB data files
+*.mat
+
+# Temporary and backup files
+*.asv
+*.bak
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

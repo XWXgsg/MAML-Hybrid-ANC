@@ -1,0 +1,491 @@
+\documentclass{internoise2026}
+
+\begin{document}
+
+\title{Fast-Converging Hybrid Active Noise Control with Joint Meta-Initialization}
+
+\maketitle
+
+\begin{flushleft}
+  Wenxuan Xu,\markcorrespondingpresenting{}
+  Zhicheng Zhang
+
+  \correspondingpresentingemail{your.email@example.com}
+
+  \institution[]{%
+    School / Department name\\
+    University / Institution name\\
+    City, Country
+  }
+\end{flushleft}
+
+\smallskip
+\begin{abstract}
+This paper proposes a meta-learning-based fast-convergence active noise control algorithm for hybrid noise during rapid acceleration, where low-frequency road noise and frequency-varying engine harmonic noise coexist. Conventional hybrid active noise control systems usually combine a broadband filtered-x least mean square filter and a narrowband adaptive notch filter. However, under fast engine-speed variations, both branches can suffer from slow convergence and tracking lag, which degrades the overall noise reduction performance. To address this limitation, an improved model-agnostic meta-learning framework is adopted to train the initial parameters of the broadband control filter and the narrowband notch filter offline by using historical noise data from diverse operating conditions. The resulting meta-initialization enables online adaptation to start from a near-optimal point when new acceleration scenarios are encountered. The broadband branch is initialized by a modified meta-learned filtered-x least mean square filter, while the narrowband branch uses frequency-indexed meta-initialized sine and cosine notch weights with residual online adaptation. Simulation studies are designed for rapid frequency sweeps and combined road-noise conditions to evaluate convergence speed, harmonic tracking accuracy, and steady-state attenuation.
+\end{abstract}
+
+\section{Introduction}
+
+Active noise control (ANC) reduces unwanted sound by generating a secondary sound field that destructively interferes with the primary disturbance at one or more error microphones. In vehicle cabins, two different noise classes are often present during acceleration. Broadband road noise is distributed over a relatively wide frequency band and is commonly handled by an adaptive finite impulse response controller. Engine-related tonal or order noise is concentrated at harmonics whose frequencies vary with rotational speed, and is more efficiently controlled by adaptive notch filters driven by sine and cosine references.
+
+The filtered-x least mean square (FxLMS) algorithm remains a practical baseline for feedforward broadband ANC because of its low implementation cost and direct use of a secondary-path model \cite{widrow1975adaptive,burgess1981active,kuo1996active,elliott2001signal}. For narrowband ANC, internally generated sine and cosine references can be filtered through the secondary-path estimate, and the corresponding notch weights can be adapted by a filtered-x LMS rule. These two branches form a natural hybrid ANC structure. The difficulty is that the adaptive filters are usually initialized at zero or at a fixed nominal value. During rapid acceleration, the optimal broadband controller and the optimal notch weights can change before the adaptive algorithms have fully converged. The resulting transient lag is especially visible when the engine order frequency sweeps over the control band.
+
+Meta-learning provides a way to improve this transient behavior by learning an initialization that is useful across a family of related tasks. Modified model-agnostic meta-learning (MAML) has been shown to accelerate adaptive ANC by training an initial control filter from previously observed noise data \cite{finn2017model,shi2021fast}. Instead of replacing online adaptation, the meta-learned parameters are used as the starting point for a conventional adaptive controller. This preserves the simplicity of FxLMS while reducing the initial adaptation burden.
+
+This paper extends this idea to a hybrid ANC setting. The proposed method jointly meta-initializes the broadband and narrowband branches. The broadband branch follows the modified MAML-FxLMS implementation in the current project, where multiple broadband noise tracks are sampled to train an initial finite impulse response controller. The narrowband branch follows the multi-channel MAML-notch implementation, where sine and cosine notch weights are trained over a frequency grid and then interpolated online during a frequency sweep. The online controller combines these meta-initialized branches with residual LMS adaptation so that the controller can both start close to the offline optimum and continue tracking scenario-specific deviations.
+
+The main contributions of this framework are as follows. First, a unified hybrid ANC formulation is provided for simultaneous broadband road-noise suppression and frequency-varying harmonic cancellation. Second, a joint meta-initialization strategy is developed from the project code by combining modified MAML-FxLMS and frequency-indexed MAML-notch training. Third, a residual rebasing strategy is used in the narrowband branch so that the online notch weights move with the interpolated meta-initialization as the target frequency changes. Finally, a simulation protocol is outlined for rapid acceleration and combined-noise scenarios, with result figures left as placeholders for the final numerical data.
+
+\section{Hybrid ANC formulation}
+
+Consider a feedforward ANC system with $M$ secondary loudspeakers and $L$ error microphones. The total primary disturbance at the error microphones is modeled as the sum of a broadband component and one or more harmonic components,
+\begin{equation}
+  \mathbf{d}(n) = \mathbf{d}_{\mathrm{b}}(n) + \mathbf{d}_{\mathrm{h}}(n),
+  \label{eq:disturbance}
+\end{equation}
+where $\mathbf{d}(n)\in\mathbb{R}^{L}$ is the disturbance vector. The control signals generated by the broadband and narrowband branches are denoted by $\mathbf{u}_{\mathrm{b}}(n)$ and $\mathbf{u}_{\mathrm{h}}(n)$, respectively. After propagation through the secondary paths, the error signal is
+\begin{equation}
+  \mathbf{e}(n) =
+  \mathbf{d}(n)
+  + \mathbf{S}(z)\mathbf{u}_{\mathrm{b}}(n)
+  + \mathbf{S}(z)\mathbf{u}_{\mathrm{h}}(n),
+  \label{eq:error}
+\end{equation}
+where $\mathbf{S}(z)$ represents the multi-channel secondary path. The sign convention in \eqref{eq:error} follows the narrowband implementation in the project, where the secondary sound is added to the disturbance and the adaptive update is written as gradient descent on the squared error.
+
+The proposed hybrid controller is decomposed as
+\begin{equation}
+  \mathbf{u}(n)=\mathbf{u}_{\mathrm{b}}(n)+\mathbf{u}_{\mathrm{h}}(n).
+  \label{eq:control_sum}
+\end{equation}
+This decomposition allows the broadband controller to handle the wideband residual structure while the notch controller focuses its degrees of freedom on rapidly varying tonal components.
+
+\subsection{Broadband FxLMS branch}
+
+In the broadband branch, the reference signal is filtered by the estimated secondary path before the control filter is updated. For a single reference channel, the filtered reference vector is
+\begin{equation}
+  \mathbf{x}'(n)=
+  \begin{bmatrix}
+    x'(n) & x'(n-1) & \cdots & x'(n-N+1)
+  \end{bmatrix}^{\mathrm{T}},
+  \label{eq:filtered_reference}
+\end{equation}
+where $N$ is the control-filter length. The broadband control output is generated from the adaptive filter $\mathbf{w}_{\mathrm{b}}(n)$,
+\begin{equation}
+  y_{\mathrm{b}}(n) = \mathbf{w}_{\mathrm{b}}^{\mathrm{T}}(n)\mathbf{x}'(n).
+  \label{eq:broadband_output}
+\end{equation}
+With the conventional sign convention used in the broadband code, the FxLMS recursion is
+\begin{equation}
+  \mathbf{w}_{\mathrm{b}}(n+1)
+  = \mathbf{w}_{\mathrm{b}}(n) + \mu_{\mathrm{b}} e(n)\mathbf{x}'(n),
+  \label{eq:fxlms}
+\end{equation}
+where $\mu_{\mathrm{b}}$ is the broadband step size. In the current MATLAB project, this branch is implemented by the files \texttt{Rnc/Main\_tst\_function.m}, \texttt{Rnc/class/MAML\_Nstep\_forget.m}, and \texttt{Rnc/class/FxLMS.m} or its backup equivalent.
+
+\subsection{Narrowband notch branch}
+
+For the narrowband branch, the controller internally generates sinusoidal references for each target frequency $f_k(n)$. The phase accumulator is
+\begin{equation}
+  \theta_k(n)=\theta_k(n-1)+2\pi f_k(n)/f_s,
+  \label{eq:phase}
+\end{equation}
+where $f_s$ is the sampling frequency. The two basis references are
+\begin{equation}
+  x_{\mathrm{s},k}(n)=\sin\theta_k(n),
+  \qquad
+  x_{\mathrm{c},k}(n)=\cos\theta_k(n).
+  \label{eq:sin_cos}
+\end{equation}
+After filtering through the secondary-path estimate from loudspeaker $m$ to microphone $l$, the filtered references are denoted by $r_{\mathrm{s},kml}(n)$ and $r_{\mathrm{c},kml}(n)$. The narrowband control signal at loudspeaker $m$ is
+\begin{equation}
+  u_{\mathrm{h},m}(n)=
+  \sum_{k}
+  \left[
+  w_{\mathrm{s},km}(n)\sin\theta_k(n)
+  + w_{\mathrm{c},km}(n)\cos\theta_k(n)
+  \right].
+  \label{eq:notch_control}
+\end{equation}
+The corresponding multi-channel filtered-x update is
+\begin{equation}
+  w_{\mathrm{s},km}(n+1)
+  =
+  w_{\mathrm{s},km}(n)
+  - \alpha_k(n)\sum_{l=1}^{L} r_{\mathrm{s},kml}(n)e_l(n),
+  \label{eq:notch_update_sin}
+\end{equation}
+\begin{equation}
+  w_{\mathrm{c},km}(n+1)
+  =
+  w_{\mathrm{c},km}(n)
+  - \alpha_k(n)\sum_{l=1}^{L} r_{\mathrm{c},kml}(n)e_l(n),
+  \label{eq:notch_update_cos}
+\end{equation}
+where $\alpha_k(n)$ is a frequency-dependent step size. This branch is implemented by \texttt{ENC/class/NotchController.m} and simulated with \texttt{ENC/class/SimulationPlatform.m}.
+
+\section{Joint meta-initialization}
+
+The proposed method uses offline meta-learning to train an initialization for each branch before online deployment. The learned parameter set is
+\begin{equation}
+  \Theta =
+  \left\{
+  \boldsymbol{\Phi}_{\mathrm{b}},
+  \boldsymbol{\Phi}_{\mathrm{s}}(f),
+  \boldsymbol{\Phi}_{\mathrm{c}}(f)
+  \right\},
+  \label{eq:theta_set}
+\end{equation}
+where $\boldsymbol{\Phi}_{\mathrm{b}}$ is the broadband initial filter, and $\boldsymbol{\Phi}_{\mathrm{s}}(f)$ and $\boldsymbol{\Phi}_{\mathrm{c}}(f)$ are frequency-indexed initial notch weights for the sine and cosine references. In the current implementation, the broadband and narrowband components are trained by two project modules and then deployed as a coordinated hybrid initialization.
+
+\subsection{Modified MAML for the broadband filter}
+
+The broadband meta-training data are constructed by randomly sampling short episodes from several previously observed noise tracks. Each episode contains a disturbance vector $\mathbf{d}_i$ and the corresponding filtered reference vectors. In the project code, three broadband noise tracks are generated by filtering white noise with different finite impulse response filters, and the corresponding disturbances and filtered references are obtained using measured or stored primary and secondary paths.
+
+For an episode indexed by $i$, the initial filter is $\boldsymbol{\Phi}_{\mathrm{b}}$. The first-step error is
+\begin{equation}
+  e_i^{+}(k)=d_i(k)-\boldsymbol{\Phi}_{\mathrm{b}}^{\mathrm{T}}\mathbf{x}'_i(k),
+  \label{eq:maml_first_error}
+\end{equation}
+and the pseudo-optimal filter after one inner FxLMS step is
+\begin{equation}
+  \mathbf{w}_i =
+  \boldsymbol{\Phi}_{\mathrm{b}}
+  + \mu_{\mathrm{b}} e_i^{+}(k)\mathbf{x}'_i(k).
+  \label{eq:maml_inner}
+\end{equation}
+The adapted filter is then evaluated over the rest of the sampled episode. With a forgetting factor $\lambda$, the meta-update is
+\begin{equation}
+  \boldsymbol{\Phi}_{\mathrm{b}}
+  \leftarrow
+  \boldsymbol{\Phi}_{\mathrm{b}}
+  + \varepsilon_{\mathrm{b}}
+  \frac{\mu_{\mathrm{b}}}{N}
+  \sum_{j=0}^{N-1}
+  \lambda^{j} e_i(k-j)\mathbf{x}'_i(k-j),
+  \label{eq:broadband_meta_update}
+\end{equation}
+where $\varepsilon_{\mathrm{b}}$ is the meta learning rate. This equation follows the modified MAML implementation in \texttt{MAML\_Nstep\_forget.m}. The meta-trained $\boldsymbol{\Phi}_{\mathrm{b}}$ is subsequently used as the initial value of the online broadband FxLMS controller.
+
+\subsection{MAML for the frequency-indexed notch weights}
+
+For the narrowband branch, meta-training is performed over a frequency grid. At each frequency $f_q$, the code generates sine and cosine references, filters them through the secondary paths, samples training episodes, and updates one pair of meta-parameters for each loudspeaker-microphone path:
+\begin{equation}
+  \boldsymbol{\Phi}_{\mathrm{s}}(f_q)
+  =
+  \left[\Phi_{\mathrm{s},ml}(f_q)\right]_{M\times L},
+  \qquad
+  \boldsymbol{\Phi}_{\mathrm{c}}(f_q)
+  =
+  \left[\Phi_{\mathrm{c},ml}(f_q)\right]_{M\times L}.
+  \label{eq:notch_phi}
+\end{equation}
+For microphone $l$, the error generated by the current meta-initialization is
+\begin{equation}
+  e_l(n)=d_l(n)
+  +\sum_{m=1}^{M}
+  \left[
+  \Phi_{\mathrm{s},ml} r_{\mathrm{s},ml}(n)
+  +\Phi_{\mathrm{c},ml} r_{\mathrm{c},ml}(n)
+  \right].
+  \label{eq:notch_meta_error}
+\end{equation}
+One inner update gives the temporary weights
+\begin{equation}
+  W_{\mathrm{s},ml} =
+  \Phi_{\mathrm{s},ml}
+  - \mu_f e_l(n)r_{\mathrm{s},ml}(n),
+  \qquad
+  W_{\mathrm{c},ml} =
+  \Phi_{\mathrm{c},ml}
+  - \mu_f e_l(n)r_{\mathrm{c},ml}(n),
+  \label{eq:notch_inner}
+\end{equation}
+where $\mu_f$ is the frequency-dependent inner-loop step size. The meta-gradient is accumulated over the episode:
+\begin{equation}
+  \Phi_{\mathrm{s},ml}
+  \leftarrow
+  \Phi_{\mathrm{s},ml}
+  -
+  \varepsilon_{\mathrm{h}}
+  \frac{\mu_f}{N_{\mathrm{ep}}}
+  \sum_{j=0}^{N_{\mathrm{ep}}-1}
+  \lambda^j e_l(j)r_{\mathrm{s},ml}(j),
+  \label{eq:notch_meta_s}
+\end{equation}
+\begin{equation}
+  \Phi_{\mathrm{c},ml}
+  \leftarrow
+  \Phi_{\mathrm{c},ml}
+  -
+  \varepsilon_{\mathrm{h}}
+  \frac{\mu_f}{N_{\mathrm{ep}}}
+  \sum_{j=0}^{N_{\mathrm{ep}}-1}
+  \lambda^j e_l(j)r_{\mathrm{c},ml}(j).
+  \label{eq:notch_meta_c}
+\end{equation}
+The resulting frequency table is saved in the project as \texttt{MAML\_weight\_table\_manual.mat}. The layout stores the frequency in the first column and then stores sine and cosine weights for each $(m,l)$ pair. During online control, the per-loudspeaker initialization is obtained by summing over microphones,
+\begin{equation}
+  w_{\mathrm{s},m}^{0}(f)=\sum_{l=1}^{L}\Phi_{\mathrm{s},ml}(f),
+  \qquad
+  w_{\mathrm{c},m}^{0}(f)=\sum_{l=1}^{L}\Phi_{\mathrm{c},ml}(f),
+  \label{eq:sum_mics}
+\end{equation}
+and interpolating between trained frequency points.
+
+\subsection{Online residual rebasing for frequency sweeps}
+
+During acceleration, the harmonic frequency changes over time. Directly adapting from a fixed initial notch weight can create tracking lag. The current project therefore uses residual rebasing in \texttt{ENC/Validate\_sweep\_freq.m}. Let $\mathbf{w}^{0}(f_n)$ be the interpolated meta-initialized notch vector at the current delayed control frequency $f_n$. The residual at the previous sample is
+\begin{equation}
+  \Delta\mathbf{w}(n-1)=
+  \mathbf{w}(n-1)-\mathbf{w}^{0}(f_{n-1}).
+  \label{eq:residual}
+\end{equation}
+Before applying the LMS update at the new frequency, the controller is re-based as
+\begin{equation}
+  \mathbf{w}(n)=
+  \mathbf{w}^{0}(f_n)+\Delta\mathbf{w}(n-1).
+  \label{eq:rebasing}
+\end{equation}
+This step moves the controller with the learned frequency-dependent optimum while preserving the online residual correction learned from the current scenario. In other words, the meta-initialization handles the expected frequency trend, and the residual LMS update handles mismatch.
+
+The MATLAB implementation is deliberately minimal. At each sample, the current interpolated baseline is first evaluated, the previously accumulated LMS residual is transported to this new baseline, and the ordinary filtered-x LMS update is then applied:
+\begin{verbatim}
+% Step 1: interpolated optimum at the current frequency
+w_base_now = get_w_base(f_ctrl, interp_w_sin, interp_w_cos, M);
+
+% Step 2: carry the previous LMS residual to the new baseline
+delta_w   = ctrl_ml.w - w_base_prev;
+ctrl_ml.w = w_base_now + delta_w;
+
+% Step 3: ordinary LMS iteration using the delayed error signal
+u_ml = ctrl_ml.iterate(e_delayed_ml);
+
+% Step 4: store this baseline for the next sample
+w_base_prev = w_base_now;
+\end{verbatim}
+
+This formulation is cleaner than resetting the controller, clipping the weights, or manually smoothing the trajectory, because it does not interfere with the LMS update itself. It only changes the coordinate system in which the online adaptation is performed. The controller weight can be interpreted as
+\begin{equation}
+  \mathbf{w}(n)=\mathbf{w}^{0}(f_n)+\Delta\mathbf{w}(n),
+  \label{eq:weight_decomposition}
+\end{equation}
+where $\mathbf{w}^{0}(f_n)$ is the frequency-dependent meta-initialized optimum and $\Delta\mathbf{w}(n)$ is the residual correction learned online.
+
+\subsection{Diagnostic interpretation of the \texorpdfstring{$w_{\mathrm{s}}$}{w-sin} valley}
+
+The \texttt{ENC/Analyze\_w\_sin\_valley.m} diagnostic script was added to quantify the observed $w_{\mathrm{s}}$ valley. The script compares two online notch controllers under the same sweep condition: a fixed-initialization MAML controller, which starts from $\mathbf{w}^{0}(f_{\mathrm{start}})$ and lets LMS chase the moving optimum, and the residual-rebased MAML controller described above. The diagnostic evaluates the angle between the online weight vector and the interpolated optimum,
+\begin{equation}
+  \phi(n)=
+  \cos^{-1}
+  \left(
+  \frac{\mathbf{w}^{\mathrm{T}}(n)\mathbf{w}^{0}(f_n)}
+  {\|\mathbf{w}(n)\|_2\|\mathbf{w}^{0}(f_n)\|_2}
+  \right),
+  \label{eq:angle_metric}
+\end{equation}
+the normalized distance $\|\mathbf{w}(n)-\mathbf{w}^{0}(f_n)\|_2/\|\mathbf{w}^{0}(f_n)\|_2$, the first negative projection point, the first $w_{\mathrm{s}}$ zero crossing, and the frequency at which $w_{\mathrm{s}}$ reaches its minimum value.
+
+For the present weight table, loudspeaker 1 does not show a sine-weight zero crossing in the trained frequency range. Its interpolated $w_{\mathrm{s}}$ reaches a minimum of 7.072 at 132 Hz and the minimum weight-vector norm occurs at 144 Hz. Loudspeaker 2 is the problematic channel: its interpolated $w_{\mathrm{s}}$ crosses zero at 24.61 Hz, reaches $-72.54$ at 57 Hz, and has a phase span of approximately 391.1 degrees over the 20--200 Hz range. This indicates that the moving optimum rotates substantially in the sine-cosine plane.
+
+The online trajectory confirms the mechanism of the valley. For loudspeaker 2 with fixed MAML initialization, $w_{\mathrm{s}}$ crosses zero at 39.14 Hz, the angle to the interpolated optimum first exceeds 45 degrees at 39.84 Hz, and it exceeds 90 degrees at 66.01 Hz. At the same frequency, the projection of the online weight onto the interpolated optimum becomes negative, meaning that the controller is partially acting against the desired control direction. The deepest online $w_{\mathrm{s}}$ valley is $-106.9$ at 89.55 Hz, and the maximum angular mismatch reaches 180 degrees near 106.26 Hz. With residual rebasing, the 90-degree crossing is delayed to 91.45 Hz and the maximum normalized error is reduced from 3.10 to 2.22 in this diagnostic run.
+
+These numbers support the interpretation that the valley is not simply an LMS instability. It is a coordinate-tracking problem caused by using a fixed initial optimum while the true optimum rotates with frequency. When the rotation becomes large, LMS must pull the weight vector through a long path in the sine-cosine plane, and the useful control component can become very small or even oppositely directed. Residual rebasing reduces this problem by moving the baseline with frequency and leaving LMS to estimate only the mismatch residual.
+
+\subsection{Delay-aware training and deployment}
+
+The narrowband training and validation scripts include two delay parameters. The reference delay $d_{\mathrm{ref}}$ models sensor, analog-to-digital conversion, and controller pipeline latency. The error delay $d_{\mathrm{err}}$ models error-microphone acquisition latency. In training, filtered sine and cosine references are generated using the same delayed reference convention as online deployment. The LMS update uses the delayed error signal. The code also checks the approximate stability condition
+\begin{equation}
+  d_{\mathrm{err}} < \frac{f_s}{4f_0}.
+  \label{eq:delay_stability}
+\end{equation}
+This delay-aware design is important because a meta-initialization trained without the deployment delays can become phase-mismatched when used in a practical real-time controller.
+
+\section{Simulation design}
+
+This section records the simulation configuration reflected in the current MATLAB code. Numerical values and plots will be inserted after the final batch of simulations is run.
+
+\subsection{Broadband road-noise branch}
+
+The broadband branch is configured with a sampling frequency of $f_s=16$ kHz and a control-filter length of $N=512$. The training duration in the current script is 3 s. Three broadband training tracks are generated by filtering white noise with three different passbands, representing diverse road-noise spectral conditions. Primary disturbances are produced through the stored primary-path model, and filtered references are generated through the stored secondary-path model. The modified MAML algorithm uses randomly sampled episodes to train the broadband initial control filter $\boldsymbol{\Phi}_{\mathrm{b}}$.
+
+\begin{table}[htbp!]
+\caption{Nominal broadband training configuration from the current project code.}
+\label{tab:broadband_config}
+\centering
+\begin{tabular}{c c}
+\hline
+\textbf{Parameter} & \textbf{Value} \\
+\hline
+Sampling frequency & 16 kHz \\
+Control-filter length & 512 taps \\
+Training tracks & 3 broadband tracks \\
+Episode source & Randomly sampled filtered-reference and disturbance pairs \\
+Forgetting factor & 0.99 \\
+Meta learning rate & 0.5 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Narrowband acceleration branch}
+
+The narrowband branch is configured as a two-loudspeaker, two-error-microphone system with a 128-tap secondary-path model. The meta-training script stores frequency-indexed weights for sine and cosine references. The nominal training grid in the current script is 50 to 200 Hz with 1 Hz resolution, while the validation script reads the actual range from the stored weight table. In the final paper, the reported range should match the regenerated weight table used for the results.
+
+For sweep validation, the instantaneous frequency is modeled as
+\begin{equation}
+  f(n)=f_{\mathrm{start}}+\gamma n/f_s,
+  \label{eq:sweep}
+\end{equation}
+where $\gamma$ is the sweep rate in Hz/s. The current validation script uses a 10 Hz/s sweep and evaluates the residual error over frequency bins.
+
+\begin{table}[htbp!]
+\caption{Nominal narrowband MAML-notch configuration from the current project code.}
+\label{tab:narrowband_config}
+\centering
+\begin{tabular}{c c}
+\hline
+\textbf{Parameter} & \textbf{Value} \\
+\hline
+Sampling frequency & 16 kHz \\
+Secondary-path order & 128 taps \\
+Loudspeakers and microphones & $M=2$, $L=2$ \\
+Training frequency resolution & 1 Hz \\
+Episode length & 512 samples \\
+Training epochs per frequency & 20000 \\
+Reference delay & 0 samples \\
+Error delay & 3 samples \\
+Sweep rate for validation & 10 Hz/s \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Compared methods}
+
+The final numerical section should compare the following controllers:
+\begin{itemize}[noitemsep]
+  \item Conventional hybrid ANC with zero-initialized broadband FxLMS and zero-initialized adaptive notch weights.
+  \item Hybrid ANC with only broadband MAML initialization.
+  \item Hybrid ANC with only narrowband MAML-notch initialization and residual rebasing.
+  \item Proposed hybrid ANC with joint broadband and narrowband meta-initialization.
+\end{itemize}
+The main evaluation metrics are convergence time, mean square error reduction, per-frequency-bin noise reduction, and tracking error under rapid harmonic frequency variation.
+
+\section{Preliminary result placeholders}
+
+The result figures are intentionally left blank in this draft. They are included as placeholders so that the final simulation outputs can be inserted without changing the paper structure.
+
+\begin{figure}[htbp!]
+  \centering
+  \fbox{%
+    \begin{minipage}[c][1.65in][c]{0.82\textwidth}
+      \centering
+      Placeholder for the proposed hybrid ANC block diagram.\\
+      Suggested content: broadband MAML-FxLMS branch, MAML-notch branch, secondary paths, error microphones, and joint meta-initialization database.
+    \end{minipage}}
+  \caption{Architecture of the proposed hybrid active noise control system with joint meta-initialization.}
+  \label{fig:block_diagram}
+\end{figure}
+
+\begin{figure}[htbp!]
+  \centering
+  \fbox{%
+    \begin{minipage}[c][1.65in][c]{0.82\textwidth}
+      \centering
+      Placeholder for offline meta-training curves.\\
+      Suggested content: broadband MAML residual error and narrowband frequency-indexed training error.
+    \end{minipage}}
+  \caption{Offline meta-training behavior for the broadband and narrowband branches.}
+  \label{fig:training_curves}
+\end{figure}
+
+\begin{figure}[htbp!]
+  \centering
+  \fbox{%
+    \begin{minipage}[c][1.65in][c]{0.82\textwidth}
+      \centering
+      Placeholder for rapid sweep validation.\\
+      Suggested content: ANC-off error power, conventional FxLMS/notch error power, and proposed residual MAML-notch error power versus time or frequency.
+    \end{minipage}}
+  \caption{Error power during a rapid harmonic frequency sweep.}
+  \label{fig:sweep_error}
+\end{figure}
+
+\begin{figure}[htbp!]
+  \centering
+  \fbox{%
+    \begin{minipage}[c][1.65in][c]{0.82\textwidth}
+      \centering
+      Placeholder for per-bin noise reduction.\\
+      Suggested content: bar plot of conventional and proposed methods over frequency bins.
+    \end{minipage}}
+  \caption{Per-frequency-bin noise reduction under the sweep condition.}
+  \label{fig:per_bin_nr}
+\end{figure}
+
+\begin{figure}[htbp!]
+  \centering
+  \fbox{%
+    \begin{minipage}[c][1.65in][c]{0.82\textwidth}
+      \centering
+      Placeholder for combined broadband and narrowband simulation.\\
+      Suggested content: total residual error for zero initialization, single-branch meta-initialization, and proposed joint meta-initialization.
+    \end{minipage}}
+  \caption{Hybrid-noise attenuation under combined broadband road noise and frequency-varying harmonic noise.}
+  \label{fig:hybrid_result}
+\end{figure}
+
+\begin{table}[htbp!]
+\caption{Placeholder table for final numerical comparison.}
+\label{tab:result_summary}
+\centering
+\begin{tabular}{c c c c}
+\hline
+\textbf{Method} & \textbf{Convergence time} & \textbf{Mean NR} & \textbf{Tracking error} \\
+\hline
+Conventional hybrid ANC & TODO & TODO & TODO \\
+Broadband meta-init only & TODO & TODO & TODO \\
+Narrowband meta-init only & TODO & TODO & TODO \\
+Proposed joint meta-init & TODO & TODO & TODO \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+The expected advantage of the proposed method comes from separating the slowly varying structure learned offline from the scenario-specific residual learned online. The broadband meta-initialization reduces the cold-start period of the finite impulse response controller. The frequency-indexed notch initialization supplies a near-optimal sine-cosine weight pair at each harmonic frequency, and residual rebasing prevents the online notch filter from lagging behind the moving optimum. Because the online update remains LMS-based, the computational cost during deployment is close to that of a conventional hybrid ANC controller, except for the interpolation and rebasing operations in the notch branch.
+
+The current code base also highlights several implementation issues that should be addressed before the final manuscript is submitted. First, the final reported frequency range must be made consistent between the training script and the stored weight table. Second, the broadband and narrowband branches should be evaluated both separately and together, so that the contribution of each meta-initialized component is clear. Third, the delay parameters used in training and validation should be reported explicitly, since reference and error delays directly affect the phase of the notch controller during rapid sweeps.
+
+\section{Conclusions}
+
+This paper draft presented a hybrid ANC framework with joint meta-initialization for rapid acceleration noise. The method combines a modified MAML-initialized broadband FxLMS filter with a frequency-indexed MAML-initialized adaptive notch filter. The narrowband branch further uses residual rebasing so that the online weights follow the interpolated meta-initialization as the harmonic frequency changes. Based on the current MATLAB implementation, the proposed framework is ready for numerical evaluation under broadband road-noise, harmonic sweep, and combined hybrid-noise scenarios. The final version will insert the generated result figures and quantitative comparisons into the placeholders provided in this draft.
+
+\section*{Acknowledgements}
+
+The authors acknowledge the open modified MAML ANC implementation and the project contributors who developed the MATLAB simulation modules used as the basis of this study.
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\section*{Appendix A: Mapping between paper sections and code}
+
+\begin{table}[htbp!]
+\caption{Main MATLAB files used to construct the proposed framework.}
+\label{tab:code_mapping}
+\centering
+\begin{tabular}{c c}
+\hline
+\textbf{Paper component} & \textbf{Project file} \\
+\hline
+Broadband MAML-FxLMS training & \texttt{Rnc/Main\_tst\_function.m} \\
+Broadband modified MAML update & \texttt{Rnc/class/MAML\_Nstep\_forget.m} \\
+Narrowband MAML-notch training & \texttt{ENC/Main\_maml\_notch.m} \\
+Notch controller online update & \texttt{ENC/class/NotchController.m} \\
+Frequency sweep validation & \texttt{ENC/Validate\_sweep\_freq.m} \\
+$w_{\mathrm{s}}$ valley diagnostic & \texttt{ENC/Analyze\_w\_sin\_valley.m} \\
+Multi-channel acoustic simulation & \texttt{ENC/class/SimulationPlatform.m} \\
+\hline
+\end{tabular}
+\end{table}
+
+\end{document}
